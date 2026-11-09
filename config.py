@@ -59,7 +59,7 @@ VOICE_BRASS = 0.6          # metallic "inside a brass head" effect: 0 = off, 1 =
 
 # Listening (faster-whisper speech-to-text). Runs on the CPU so it doesn't compete with
 # Ollama for GPU memory. The model downloads automatically the first time (about 150 MB for base.en).
-WHISPER_MODEL = "base.en"  # "tiny.en" = fastest, "base.en" = good balance, "small.en" = more accurate, slower
+WHISPER_MODEL = "small.en"  # "tiny.en" = fastest, "base.en" = good balance, "small.en" = more accurate, slower
 WHISPER_DEVICE = "cpu"     # "cuda" is faster, but needs NVIDIA's cuBLAS/cuDNN libraries installed
 WHISPER_COMPUTE = "int8"   # int8 is fastest on a CPU
 WHISPER_BEAM = 5           # 1 = fastest; 5 = more accurate
@@ -67,7 +67,8 @@ WHISPER_BEAM = 5           # 1 = fastest; 5 = more accurate
 WHISPER_EXTRA_WORDS = ("Chvorinov, martensite, austenite, ferrite, cementite, pearlite, eutectic, "
                        "eutectoid, Poisson's ratio, Young's modulus, sintering, thermoset, thermoplastic, "
                        "elastomer, galvanic, Laplace, Fourier, eigenvalue, eigenvector, Kirchhoff, "
-                       "Thevenin, capacitor, impedance, Arduino, ESP32, MicroPython")
+                       "Thevenin, capacitor, impedance, Arduino, ESP32, MicroPython, Kirchhoff's current law, "
+                       "Kirchhoff's voltage law, Ohm's law, Hooke's law")
 
 # Recording from the laptop microphone (listen.py, talk.py). The Bela does its own recording.
 LISTEN_MAX_SECONDS = 8       # longest question allowed
@@ -75,5 +76,9 @@ LISTEN_SILENCE_SECONDS = 1.2 # stop this long after the speaker goes quiet
 LISTEN_START_TIMEOUT = 6     # give up if nobody starts speaking within this time
 
 # Server (the Bela/ESP32 calls this over Wi-Fi)
+# Every question the Bela sends is saved here as a WAV (the newest SAVE_QUESTIONS are kept), to check levels/noise.
+QUESTIONS_DIR = Path(__file__).parent / "heard"
+SAVE_QUESTIONS = 30
+
 SERVER_HOST = "0.0.0.0"    # listen on the network, not just this laptop
 SERVER_PORT = 8000

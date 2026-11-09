@@ -7,6 +7,10 @@ Endpoints (JSON):
     POST /speak           <- {"text": "..."}            -> audio/wav (the Head's voice)
     POST /listen          <- WAV audio (body, Content-Type audio/wav)
                           -> {"text": "what is martensite", "audio_seconds": 2.1, "transcribe_s": 0.6}
+    POST /ritual?tokens=2&rate=44100  <- WAV audio of the spoken question (body)
+                          -> audio/wav: the spoken answer + reveal, mono 16-bit at `rate`
+                             (headers: X-Heard, X-Answerable, X-Notes, X-Timings). Each exchange is
+                             appended to ritual_log.jsonl.
     POST /ask             <- {"question": "what is martensite", "tokens": 3}
                           -> {"answerable": true, "answer": "...", "reveal": "...",
                               "sources": [{"note": ..., "section": ...}], "timings": {...}}
@@ -19,11 +23,16 @@ The models are loaded when the server starts and stay loaded until you stop it (
 which unloads them and frees the GPU.
 """
 import json
+import random
 import socket
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
+
+import numpy as np
 
 import config
 from head import Head
@@ -33,6 +42,13 @@ voice = None                    # loaded at start if a voice model is present (s
 ears = None                     # Whisper, loaded at start if faster-whisper is installed
 ears_lock = threading.Lock()    # Whisper runs on the CPU, separately from the GPU lock
 gpu_lock = threading.Lock()     # one question at a time: the GPU can't run two well
+
+RITUAL_LOG = Path(__file__).parent / "ritual_log.jsonl"
+NOT_HEARD = [
+    "Speak up, mortal. The Head heard nothing.",
+    "Your words were lost in the brass. Ask again.",
+]
+REVEAL_PAUSE = 0.7              # seconds of silence between the answer and the reveal
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -60,7 +76,87 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(wav)
 
+    def _send_wav_with(self, wav, headers):
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav)))
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(wav)
+
+    def _ritual(self, query):
+        """Spoken question (WAV) in -> spoken answer + reveal (WAV) out. The whole pipeline in one call."""
+        from listen import resample, to_wav
+        from voice import brass
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if ears is None or voice is None:
+            return self._send(503, {"error": "speech-to-text or voice not loaded (see the startup messages)"})
+        if not body:
+            return self._send(400, {"error": "send the WAV audio as the request body"})
+        try:
+            tokens = int(query.get("tokens", [config.DEFAULT_TOKENS])[0])
+            rate = int(query.get("rate", [0])[0]) or voice.rate
+        except ValueError:
+            return self._send(400, {"error": "tokens and rate must be whole numbers"})
+        t0 = time.time()
+        try:                                            # keep the recording for checking levels/noise
+            config.QUESTIONS_DIR.mkdir(exist_ok=True)
+            (config.QUESTIONS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}.wav").write_bytes(body)
+            for old in sorted(config.QUESTIONS_DIR.glob("*.wav"))[:-config.SAVE_QUESTIONS]:
+                old.unlink()
+        except OSError:
+            pass
+        try:
+            with ears_lock:
+                heard = ears.transcribe(body)
+        except Exception as e:
+            return self._send(400, {"error": f"couldn't read the audio: {e}"})
+        question = heard["text"].strip()
+        t_heard = time.time()
+        if len(question) < 2:
+            r = {"answerable": False, "answer": random.choice(NOT_HEARD), "reveal": "", "sources": [],
+                 "timings": {}}
+        else:
+            with gpu_lock:
+                try:
+                    r = head.ask(question, tokens=tokens)
+                except OSError as e:
+                    return self._send(503, {"error": f"Ollama unavailable: {e}"})
+        t_answered = time.time()
+
+        # Answer, a pause, then the reveal: one WAV at the Bela's sample rate.
+        parts = [voice.samples(r["answer"])]
+        if r.get("reveal"):
+            parts += [np.zeros(int(voice.rate * REVEAL_PAUSE), np.float32), voice.samples(r["reveal"])]
+        speech = brass(np.concatenate(parts), voice.rate)
+        wav = to_wav(resample(speech, voice.rate, rate), rate)
+        t_spoken = time.time()
+
+        timings = {"audio_in_s": heard["audio_seconds"], "listen_s": round(t_heard - t0, 2),
+                   "think_s": round(t_answered - t_heard, 2), "speak_s": round(t_spoken - t_answered, 2),
+                   "total_s": round(t_spoken - t0, 2), "audio_out_s": round(len(speech) / voice.rate, 2)}
+        notes = [s["note"] for s in r.get("sources", [])]
+        print(f"  ritual: heard \"{question}\" [{tokens} tokens] -> "
+              f"{'answer' if r['answerable'] else 'refusal'}; "
+              f"listen {timings['listen_s']}s + think {timings['think_s']}s + speak {timings['speak_s']}s "
+              f"= {timings['total_s']}s")
+        try:
+            with RITUAL_LOG.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "client": self.client_address[0],
+                                    "heard": question, "tokens": tokens, "answerable": r["answerable"],
+                                    "answer": r["answer"], "reveal": r.get("reveal", ""), "notes": notes,
+                                    "timings": timings}, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        return self._send_wav_with(wav, {
+            "X-Heard": quote(question), "X-Answerable": str(r["answerable"]).lower(),
+            "X-Notes": quote("; ".join(notes)), "X-Timings": json.dumps(timings)})
+
     def do_POST(self):
+        url = urlparse(self.path)
+        if url.path.rstrip("/") == "/ritual":
+            return self._ritual(parse_qs(url.query))
         if self.path.rstrip("/") == "/listen":
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
             if ears is None:
@@ -147,7 +243,7 @@ def main():
 
     server = ThreadingHTTPServer((config.SERVER_HOST, config.SERVER_PORT), Handler)
     print(f"Listening on http://localhost:{config.SERVER_PORT}  "
-          f"(from the Bela/ESP32: http://{lan_ip()}:{config.SERVER_PORT}/ask)")
+          f"(from the Bela: http://{lan_ip()}:{config.SERVER_PORT}/ritual)")
     print("Ctrl+C to stop and free the GPU.\n")
     try:
         server.serve_forever()

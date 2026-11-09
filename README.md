@@ -162,7 +162,7 @@ Not committed (see `.gitignore`): `.venv/`, `index/` (rebuilt by `indexer.py`), 
 - [x] Retrieval, answering, refusals and reveal (tested with real models)
 - [x] Voice (Piper) and listening (Whisper); full spoken loop working on the laptop
 - [ ] Ritual protocol with the hardware: idle → tokens → chew → wake → listen → think → speak → reveal → sleep
-- [ ] A single `/ritual` endpoint (audio + token count in, answer + reveal audio out) and a log of every exchange
+- [x] A single `/ritual` endpoint (audio + token count in, answer + reveal audio out) and a log of every exchange (`ritual_log.jsonl`); Bela project in `bela/`
 - [ ] Wi-Fi test from an ESP32, then the Bela: recording, playback, jaw lip-sync, break-beam token count, head turn
 - [ ] Demo reliability: start-up script, in-character fallback if the server is slow, laptop hotspot
 

@@ -50,9 +50,20 @@ def wav_to_float(wav_bytes: bytes) -> np.ndarray:
     return resample(x, rate, RATE)
 
 
+def lowpass(x: np.ndarray, cutoff: float, taps: int = 127) -> np.ndarray:
+    """Windowed-sinc low-pass FIR. cutoff is a fraction of the sample rate (0..0.5)."""
+    n = np.arange(taps) - (taps - 1) / 2
+    h = 2 * cutoff * np.sinc(2 * cutoff * n) * np.blackman(taps)
+    return np.convolve(x, h / h.sum(), mode="same").astype(np.float32)
+
+
 def resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
     if src == dst or len(x) < 2:
         return x.astype(np.float32)
+    if dst < src:
+        # Remove everything above the new Nyquist first, otherwise hiss above 8 kHz
+        # folds back into the speech band (aliasing) and Whisper mishears words.
+        x = lowpass(x.astype(np.float32), 0.45 * dst / src)
     n = int(round(len(x) * dst / src))
     return np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype(np.float32)
 

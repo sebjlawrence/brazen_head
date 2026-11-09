@@ -4,3 +4,6 @@ index/
 voices/
 samples/
 last_speech.wav
+ritual_log.jsonl
+*.bak
+heard/
