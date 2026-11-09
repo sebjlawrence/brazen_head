@@ -10,7 +10,9 @@
  * Wiring (as in Tutorial 2, step 1a; Bela Gem Stereo + capsule mic on a breadboard):
  *   mic - leg (joined to the case)  -> GND
  *   mic + leg -> LINE IN "L" pin (channel 0), and through a 2.2k resistor to 3.3V
- * Raise the input gain in the IDE's Audio tab (vertical-lines icon) if the levels printed below are tiny.
+ * Eye LEDs (x2): digital pin (LED_PINS) -> 330 ohm resistor -> LED long leg; LED short leg (flat side) -> GND.
+ * Token (stand-in for the IR break-beam): push button from TOKEN_PIN to 3.3V, 10k from TOKEN_PIN to GND.
+ * Mic gain is set at startup by MIC_GAIN_DB; the IDE's Audio tab can still change it live.
  */
 #include <Bela.h>
 #include <atomic>
@@ -28,7 +30,13 @@
 static const char*  SERVER          = "192.168.7.1"; // the laptop as seen from the Bela. Over USB this is
                                                      // usually 192.168.7.1 or 192.168.6.1 (ping it first)
 static const int    PORT            = 8000;
-static const int    TOKENS          = 2;      // placeholder until the break-beam counts real tokens
+// Tokens: the head sleeps until a token is fed. A push button stands in for the IR break-beam for now
+// (same kind of digital signal, so nothing changes when the break-beam replaces it).
+static const bool   REQUIRE_TOKEN   = true;   // false = always listening, eyes light when you start speaking
+static const unsigned TOKEN_PIN     = 9;      // digital input for the token button / break-beam (D9)
+static const bool   TOKEN_ACTIVE_HIGH = true; // true: reads HIGH when a token passes (button to 3.3V, 10k to GND)
+static const float  AWAKE_SECONDS   = 20.0f;  // fed but nobody speaks: the head goes back to sleep (tokens lost)
+static const int    DEFAULT_TOKENS  = 2;      // tokens sent when REQUIRE_TOKEN is false
 static const unsigned MIC_CHANNEL   = 0;      // audio input the mic is on
 static const float  MIC_GAIN_DB     = 36.0f;  // analogue preamp gain for the mic, set at startup (0 to ~59.5 dB).
                                               // Aim for question peaks of 0.3-0.5 (the server saves them in heard/)
@@ -44,12 +52,20 @@ static const bool   THINKING_HUM    = true;   // slow brassy throb while the lap
 static const float  THROB_PITCH_HZ  = 73.4f;  // fundamental (D2): lower = darker, more ominous
 static const float  THROB_RATE_HZ   = 0.6f;   // swells per second (0.6 = one every ~1.7 s)
 static const float  THROB_VOLUME    = 0.08f;  // loudness at the top of each swell
+static const unsigned LED_PINS[]    = {10, 11}; // digital pins for the two eye LEDs (D10, D11): check the IDE pin diagram
+static const bool   LEDS_PULSE      = true;   // eyes throb with the sound while thinking (false = steady glow)
+static const float  EYES_WAKE_SECONDS = 0.4f; // fade up when a token is fed
+static const float  EYES_FADE_SECONDS = 2.0f; // fade out after the answer (or when the head falls asleep)
 static const bool   PRINT_LEVELS    = true;   // print mic level twice a second (to set the thresholds)
 static const float  MAX_ANSWER_SECONDS = 90.0f;
 
 // ------------------------------------------------------------------ state
-enum State { LISTENING, RECORDING, WAITING, PLAYING };
-static std::atomic<int> gState(LISTENING);
+enum State { LISTENING, RECORDING, WAITING, PLAYING, DORMANT };
+static std::atomic<int> gState(LISTENING);   // set to DORMANT in setup() when REQUIRE_TOKEN
+static std::atomic<int> gTokens(0);          // fed and not yet spent
+static int gQuestionTokens = 0;              // tokens spent on the question being answered
+static unsigned gAwakeFrames = 0;            // how long the head has been awake without hearing a question
+static bool gTokenHigh = false; static unsigned gTokenStable = 0;   // debounce
 static std::atomic<bool> gStop(false);
 static std::thread gWorker;
 
@@ -64,6 +80,11 @@ static float gBackground = 0.002f; static unsigned gSettle = 0;   // frames to i
 static unsigned gQuietFrames = 0, gPrintCount = 0;
 static float gDcX = 0, gDcY = 0;      // DC blocker
 static float gThrobP1 = 0, gThrobP2 = 0, gThrobLfo = 0, gThrobGain = 0;   // thinking sound
+static float gSwell = 0;                  // 0..1, the slow swell shared by the throb and the eye LEDs
+static int gTokenRaw = -1;                // last raw reading of the token pin (for the debug print)
+static float gLedLevel = 0;               // 0..1, eye brightness (linear fades)
+static float gPulseDepth = 0;             // 0..1, how much the eyes throb (only while thinking)
+static unsigned gPwmCount = 0;            // software PWM so the LEDs can fade (64 steps, ~690 Hz: no flicker)
 
 // ------------------------------------------------------------------ WAV helpers (worker thread)
 static void put16(FILE* f, uint16_t v) { fputc(v & 255, f); fputc(v >> 8, f); }
@@ -143,7 +164,8 @@ static void worker()
 {
 	while(!gStop) {
 		if(gState != WAITING) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
-		printf("Asking the laptop (%.1f s of audio)...\n", gRecLen / gRate);
+		printf("Asking the laptop (%.1f s of audio, %d token%s)...\n", gRecLen / gRate,
+		       gQuestionTokens, gQuestionTokens == 1 ? "" : "s");
 		auto t0 = std::chrono::steady_clock::now();
 		bool ok = writeWav("/tmp/bh_question.wav", gRec.data(), gRecLen, (unsigned)gRate);
 		if(ok) {
@@ -151,7 +173,7 @@ static void worker()
 			snprintf(cmd, sizeof cmd,
 				"curl -sS -f -m 120 -D /tmp/bh_headers.txt -o /tmp/bh_answer.wav "
 				"-H 'Content-Type: audio/wav' --data-binary @/tmp/bh_question.wav "
-				"'http://%s:%d/ritual?tokens=%d&rate=%d'", SERVER, PORT, TOKENS, (int)gRate);
+				"'http://%s:%d/ritual?tokens=%d&rate=%d'", SERVER, PORT, gQuestionTokens, (int)gRate);
 			ok = system(cmd) == 0;
 			if(!ok) printf("Request failed. Is server.py running, and can the Bela reach http://%s:%d/health ?\n", SERVER, PORT);
 		}
@@ -166,6 +188,8 @@ static void worker()
 			gState = PLAYING;
 		} else {
 			if(ok) printf("Got a reply, but it wasn't a WAV the Bela could read.\n");
+			if(REQUIRE_TOKEN) gTokens += gQuestionTokens;   // failed: give the tokens back
+			gAwakeFrames = 0;
 			gState = LISTENING;
 		}
 	}
@@ -181,13 +205,24 @@ bool setup(BelaContext* context, void*)
 	gRec.assign((size_t)(gRate * (MAX_SECONDS + PREROLL_SECONDS)) + 1, 0.f);
 	gPlay.assign((size_t)(gRate * MAX_ANSWER_SECONDS), 0.f);
 	gSettle = (unsigned)gRate;   // learn the background level for 1 s before listening
+	printf("Digital: %u pins, %u frames per block (audio %u)\n",
+	       context->digitalChannels, context->digitalFrames, context->audioFrames);
+	if(REQUIRE_TOKEN) {
+		if(TOKEN_PIN >= context->digitalChannels) { printf("Token pin %u doesn't exist\n", TOKEN_PIN); return false; }
+		pinMode(context, 0, TOKEN_PIN, INPUT);
+		gState = DORMANT;
+	}
+	for(unsigned pin : LED_PINS) {
+		if(pin >= context->digitalChannels) { printf("LED pin %u doesn't exist (%u digital pins)\n", pin, context->digitalChannels); return false; }
+		pinMode(context, 0, pin, OUTPUT);
+	}
 	if(Bela_setAudioInputGain(MIC_CHANNEL, MIC_GAIN_DB))
 		printf("Couldn't set the mic gain to %.1f dB: set it in the IDE's Audio tab instead\n", MIC_GAIN_DB);
 	else
 		printf("Mic gain on input %u set to %.1f dB\n", MIC_CHANNEL, MIC_GAIN_DB);
 	gWorker = std::thread(worker);
-	printf("Brazen Head: %.0f Hz, mic on input %u, server http://%s:%d. Speak after 1 s.\n",
-	       gRate, MIC_CHANNEL, SERVER, PORT);
+	printf("Brazen Head: %.0f Hz, mic on input %u, server http://%s:%d.\n", gRate, MIC_CHANNEL, SERVER, PORT);
+	printf(REQUIRE_TOKEN ? "The Head sleeps. Feed it a token (pin %u), then ask.\n" : "Speak after 1 s.\n", TOKEN_PIN);
 	return true;
 }
 
@@ -207,20 +242,27 @@ static void endWindow()
 	gWinSum = 0; gWinCount = 0;
 	int state = gState;
 	float threshold = fmaxf(MIN_START_LEVEL, START_FACTOR * gBackground);
-	if(state == LISTENING) {
-		if(gSettle == 0 && gLevel > threshold) startRecording();
+	if(state == LISTENING || state == DORMANT) {
+		if(state == LISTENING && gSettle == 0 && gLevel > threshold) startRecording();
 		else gBackground = 0.98f * gBackground + 0.02f * fminf(gLevel, 4 * gBackground + 1e-4f);
 		if(PRINT_LEVELS && ++gPrintCount >= 25) {
 			gPrintCount = 0;
-			rt_printf("level %.4f  background %.4f  start above %.4f\n", gLevel, gBackground, threshold);
+			rt_printf("%s  level %.4f  background %.4f  start above %.4f  token pin D%u = %d  tokens %d\n",
+			          state == DORMANT ? "asleep" : "awake ", gLevel, gBackground, threshold,
+			          TOKEN_PIN, gTokenRaw, (int)gTokens);
 		}
 	} else if(state == RECORDING) {
 		if(gLevel < 0.5f * threshold) gQuietFrames += gWin; else gQuietFrames = 0;
 		bool full = gRecLen >= gRec.size() - gWin;
 		if(gQuietFrames >= SILENCE_SECONDS * gRate || full) {
 			float speech = (gRecLen - gQuietFrames) / gRate - PREROLL_SECONDS;
-			if(speech < MIN_SECONDS) { rt_printf("(too short, ignored)\n"); gState = LISTENING; }
-			else gState = WAITING;   // the worker thread takes it from here
+			if(speech < MIN_SECONDS) { rt_printf("(too short, ignored)\n"); gAwakeFrames = 0; gState = LISTENING; }
+			else {
+				// spend the tokens fed so far on this question (at least 1 when tokens are required)
+				gQuestionTokens = REQUIRE_TOKEN ? (int)gTokens.exchange(0) : DEFAULT_TOKENS;
+				if(gQuestionTokens < 1) gQuestionTokens = 1;
+				gState = WAITING;   // the worker thread takes it from here
+			}
 		}
 	}
 }
@@ -231,12 +273,10 @@ static float throb(bool on)
 {
 	const float twoPi = 2.f * (float)M_PI;
 	gThrobGain += ((on ? 1.f : 0.f) - gThrobGain) * 0.0005f;
-	if(gThrobGain < 1e-4f) { gThrobLfo = 0; return 0; }   // silent: restart from the bottom of a swell
-	gThrobLfo += twoPi * THROB_RATE_HZ / gRate;  if(gThrobLfo > twoPi) gThrobLfo -= twoPi;
+	if(gThrobGain < 1e-4f) return 0;
 	gThrobP1  += twoPi * THROB_PITCH_HZ / gRate; if(gThrobP1 > twoPi) gThrobP1 -= twoPi;
 	gThrobP2  += twoPi * THROB_PITCH_HZ * 1.004f / gRate; if(gThrobP2 > twoPi) gThrobP2 -= twoPi;
-	float swell = 0.5f - 0.5f * cosf(gThrobLfo);
-	swell *= swell;                                       // long quiet gap, rounded swell
+	float swell = gSwell;
 	float rolloff = 0.35f + 0.45f * swell;                // more upper harmonics when louder
 	float s = 0, w = 1;
 	for(int k = 1; k <= 8; k++) {
@@ -246,6 +286,47 @@ static float throb(bool on)
 	return THROB_VOLUME * gThrobGain * (0.12f + 0.88f * swell) * s * 0.3f;
 }
 
+// The slow swell (0..1) that drives both the throb and the eyes. Restarts from the bottom when idle.
+static void updateSwell(bool active)
+{
+	const float twoPi = 2.f * (float)M_PI;
+	if(!active) { gThrobLfo = 0; gSwell = 0; return; }
+	gThrobLfo += twoPi * THROB_RATE_HZ / gRate; if(gThrobLfo > twoPi) gThrobLfo -= twoPi;
+	float s = 0.5f - 0.5f * cosf(gThrobLfo);
+	gSwell = s * s;                                       // long quiet gap, rounded swell
+}
+
+// Eyes: wake when a token is fed, throb while thinking, glow while answering, then fade out.
+static bool eyesOn(int state)
+{
+	bool awake = REQUIRE_TOKEN ? state != DORMANT : (state == RECORDING || state == WAITING || state == PLAYING);
+	if(awake) gLedLevel = fminf(1.f, gLedLevel + 1.f / (EYES_WAKE_SECONDS * gRate));
+	else      gLedLevel = fmaxf(0.f, gLedLevel - 1.f / (EYES_FADE_SECONDS * gRate));
+	float pulseTarget = (state == WAITING && LEDS_PULSE) ? 1.f : 0.f;   // ease in/out of the throb (~0.3 s)
+	gPulseDepth += (pulseTarget > gPulseDepth ? 1.f : -1.f) * fminf(fabsf(pulseTarget - gPulseDepth), 1.f / (0.3f * gRate));
+	float b = gLedLevel * (1.f - gPulseDepth * 0.8f * (1.f - gSwell));
+	gPwmCount = (gPwmCount + 1) & 63;
+	return gPwmCount < (unsigned)(b * b * 64.f);          // squared: looks even to the eye
+}
+
+// Token sensor: a debounced rising edge (20 ms stable) counts one token and wakes the head.
+static void readToken(BelaContext* context, unsigned d)
+{
+	gTokenRaw = digitalRead(context, d, TOKEN_PIN);
+	bool high = (gTokenRaw != 0) == TOKEN_ACTIVE_HIGH;
+	if(high == gTokenHigh) { gTokenStable = 0; return; }
+	if(++gTokenStable < (unsigned)(0.02f * gRate)) return;
+	gTokenHigh = high; gTokenStable = 0;
+	if(!high) return;
+	int n = ++gTokens;
+	gAwakeFrames = 0;
+	if(gState == DORMANT) {
+		gSettle = (unsigned)(0.3f * gRate);   // don't mistake the token's clunk for speech
+		gState = LISTENING;
+		rt_printf("Token fed. The Head wakes... ask your question.\n");
+	} else rt_printf("Token fed (%d waiting).\n", n);
+}
+
 void render(BelaContext* context, void*)
 {
 	for(unsigned n = 0; n < context->audioFrames; n++) {
@@ -253,14 +334,21 @@ void render(BelaContext* context, void*)
 		float x = audioRead(context, n, MIC_CHANNEL);
 		float y = x - gDcX + 0.995f * gDcY; gDcX = x; gDcY = y;
 
+		unsigned d = context->digitalFrames ? n * context->digitalFrames / context->audioFrames : 0;
+		if(REQUIRE_TOKEN && context->digitalFrames) readToken(context, d);
+
 		int state = gState;
-		if(state == LISTENING) {
+		if(state == LISTENING && REQUIRE_TOKEN && ++gAwakeFrames > AWAKE_SECONDS * gRate) {
+			gTokens = 0; gState = state = DORMANT;
+			rt_printf("Time is past. The Head sleeps (tokens lost).\n");
+		}
+		if(state == LISTENING || state == DORMANT) {
 			gPreroll[gPreWrite] = y; gPreWrite = (gPreWrite + 1) % gPreroll.size();
 			if(gSettle) gSettle--;
 		} else if(state == RECORDING && gRecLen < gRec.size()) {
 			gRec[gRecLen++] = y;
 		}
-		if(state == LISTENING || state == RECORDING) {
+		if(state == LISTENING || state == RECORDING || state == DORMANT) {
 			gWinSum += y * y;
 			if(++gWinCount >= gWin) endWindow();
 		}
@@ -270,12 +358,20 @@ void render(BelaContext* context, void*)
 		if(state == PLAYING) {
 			if(gPlayPos < gPlayLen) out = gPlay[gPlayPos++] * OUTPUT_GAIN;
 			else {
-				gState = LISTENING; gSettle = (unsigned)(0.5f * gRate);   // ignore our own tail
-				gWinSum = 0; gWinCount = 0;
-				rt_printf("Done. Ask another question.\n");
+				gSettle = (unsigned)(0.5f * gRate);   // ignore our own tail
+				gWinSum = 0; gWinCount = 0; gAwakeFrames = 0;
+				if(REQUIRE_TOKEN && gTokens == 0) { gState = DORMANT; rt_printf("Done. The Head sleeps until the next token.\n"); }
+				else { gState = LISTENING; rt_printf("Done. Ask another question.\n"); }
 			}
 		}
+		updateSwell(state == WAITING || gThrobGain > 1e-4f || gPulseDepth > 1e-3f);
 		out += throb(state == WAITING && THINKING_HUM);
+
+		// eye LEDs (digital pins run at the audio rate on the Gem; scaled in case they don't)
+		bool eyes = eyesOn(state);
+		if(context->digitalFrames) {
+			for(unsigned pin : LED_PINS) digitalWrite(context, d, pin, eyes ? HIGH : LOW);   // holds to the end of the block
+		}
 		for(unsigned ch = 0; ch < context->audioOutChannels; ch++) audioWrite(context, n, ch, out);
 	}
 }

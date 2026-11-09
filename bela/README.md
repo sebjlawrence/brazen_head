@@ -10,6 +10,10 @@ Breadboard to the Bela Gem Stereo's header pins (not the jack):
 - mic **+** leg -> **LINE IN L** (channel 0)
 - **2.2 kΩ** (red-red-black-brown-brown) from the mic + leg to **3.3V**
 
+**Eyes (2 LEDs):** for each one, digital pin (**D10**, **D11**; `LED_PINS`) → **330 Ω** → LED long leg; LED short leg (flat side) → **GND**. Amber/warm LEDs suit the palette; white ones are dim at 3.3 V. They wake when a token is fed, throb with the sound while the head thinks, glow while it answers, then fade out over 2 s (`LEDS_PULSE`, `EYES_WAKE_SECONDS`, `EYES_FADE_SECONDS`).
+
+**Token (push button standing in for the IR break-beam):** button from **D9** (`TOKEN_PIN`) to **3.3V**, **10 kΩ** from D9 to **GND** (as in Tutorial 1). The head sleeps until a token is fed; each press is one token, and all tokens fed before a question are spent on it. If nobody asks within 20 s (`AWAKE_SECONDS`) the head falls asleep and the tokens are lost. Set `REQUIRE_TOKEN = false` to skip tokens (always listening).
+
 Check it first with the **passthrough** example (C++ > Fundamentals): tap the mic and you should hear it in one ear.
 
 ## Tonight's checklist
@@ -40,5 +44,5 @@ Check it first with the **passthrough** example (C++ > Fundamentals): tap the mi
 | Whisper hears nothing / nonsense | `INPUT_BOOST` up; check `ritual_log.jsonl` on the laptop; the question WAV is at `/tmp/bh_question.wav` on the Bela (copy it off and listen) |
 | Answer is too loud/quiet | `OUTPUT_GAIN` |
 
-Settings are all at the top of render.cpp. `TOKENS` is a placeholder until the break-beam counts tokens.
+Settings are all at the top of render.cpp. `DEFAULT_TOKENS` is only used when `REQUIRE_TOKEN` is false.
 Every exchange is logged on the laptop in `ritual_log.jsonl` (what it heard, the answer, the notes, timings).
