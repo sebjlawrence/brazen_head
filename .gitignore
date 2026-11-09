@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+index/
+voices/
+samples/
+last_speech.wav

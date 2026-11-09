@@ -1,0 +1,5 @@
+numpy
+pyyaml
+piper-tts
+faster-whisper
+sounddevice

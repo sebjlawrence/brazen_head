@@ -1,0 +1,14 @@
+# Retrieval test set: "question | note it should come from"
+# Use "-" when the answer is NOT in your notes. Replace these examples with your own (aim for 15-20).
+What is Chvorinov's rule? | Metal Casting
+How do you calculate engineering stress? | Mechanical Properties of Materials
+What is the rule of mixtures for a fibre composite? | Composites
+Why does martensite form when steel is quenched? | Altering Material Properties
+What is the difference between brazing and soldering? | Welding, Brazing, Soldering and Adhesives
+How does a capacitor block DC? | Capacitors
+Who won the 2022 football World Cup? | -
+How does a jet engine work? | -
+What is Dumbledore's first name? | -
+What is the largest bridge in the world? | -
+Why do planes fly? | -
+How do LLMs work? | -
